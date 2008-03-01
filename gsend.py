@@ -233,7 +233,7 @@ class GSMsgBuilder(object):
         return msgs
 
 class GSSender(object):
-    def __init__(self,host,port,login, paswd,attachment_size=5,email_encoding='utf-8',fs_encoding=None):
+    def __init__(self,host,port,login, paswd,attachment_size=5,email_encoding='utf-8',fs_encoding=None, tls=True):
         self.host=host
         self.port=port
         self.login=login
@@ -241,6 +241,7 @@ class GSSender(object):
         self.paswd=paswd
         self.smtp=None
         self.smtp_connected=False
+        self.tls=tls
         self.builder=GSMsgBuilder(attachment_size,email_encoding,fs_encoding)
 
     def sendFiles(self,toAddrs, files):
@@ -270,9 +271,10 @@ class GSSender(object):
         try:
             print "Connecting to SMTP server."
             smtp = SMTP(self.host,self.port)
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.ehlo()
+            if self.tls:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
             print "Logging in..."
             smtp.login(self.login,self.paswd)
             print "Login OK!"
@@ -280,7 +282,7 @@ class GSSender(object):
             self.smtp_connected=True
         except :
             traceback.print_exc()
-            print "Unable to connect!!!"
+            print >>sys.stderr,"Unable to connect!!!"
 
     def _disconnect(self):
         try:
@@ -296,7 +298,7 @@ class GSSender(object):
                 self.smtp.sendmail(self.fromAddr,toAddrs, msg.as_string())
                 return True
         except :
-            print "Failed on sending msg!"
+            print >>sys.stderr,"Failed on sending msg!"
             traceback.print_exc()
 
         return False
@@ -312,7 +314,8 @@ class Main(object):
                              self.paswd,
                              self.attachment_size,
                              self.encoding,
-                             self.fsencoding)
+                             self.fsencoding,
+                             self.tls)
     
     def parseOpts(self):
         usage="usage: %prog [options] addr1 addr2 ..."
@@ -356,6 +359,7 @@ class Main(object):
             conf.add_section("OPTIONS")
             conf.set('SERVER','host','smtp.gmail.com')
             conf.set('SERVER','port',587)
+            conf.set('SERVER','tls',True)
             conf.set('ACCOUNT','login','example@gmail.com')
             conf.set('ACCOUNT','paswd','')
             conf.set('OPTIONS','email_encoding','utf-8')
@@ -370,6 +374,7 @@ class Main(object):
             
             self.host=conf.get('SERVER','host')
             self.port=conf.getint('SERVER','port')
+            self.tls=conf.getboolean('SERVER','tls')
             self.login=conf.get('ACCOUNT','login')
             self.paswd=conf.get('ACCOUNT','paswd')
             
