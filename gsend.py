@@ -257,7 +257,7 @@ class GSSender(object):
                     if self._doSend(toAddrs, msg)==True:
                         # TODO: Sleep+Retry times
                         break
-        pass
+            print "File '%s' was sent successfully."%os.path.basename(f)
 
     def _connect(self):
         if self.smtp_connected==True:
@@ -331,6 +331,7 @@ class Main(object):
         filename=self.opts.filename
         if filename==None:
             print >>sys.stderr,"You must specify the file to send!"
+            parser.print_usage()
             sys.exit(2)
         else:
             if not os.path.exists(filename):
@@ -344,6 +345,7 @@ class Main(object):
                 sys.exit(2)
         if not self.args:
             print >>sys.stderr, "There's no receiver provided!"
+            parser.print_usage()
             sys.exit(2)
         
     def loadConfig(self):
