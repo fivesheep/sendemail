@@ -20,6 +20,7 @@ import time
 import uuid
 import traceback
 import socket
+import smtplib
 
 from ConfigParser import ConfigParser
 from getpass import getpass
@@ -32,20 +33,79 @@ from email.utils import COMMASPACE, formatdate, make_msgid
 from email import encoders
 from smtplib import SMTP
 from smtplib import SMTPServerDisconnected
-from sys import stderr
+from sys import stderr,stdout
 
+
+class ConsoleUI:
+    def __init__(self):
+        self._isInitialized=0
+        self._setupTerm()
+    
+    def _setupTerm(self):
+        import curses
+        curses.setupterm()
+        self.COLS=curses.tigetnum('cols')
+        self.BOL=curses.tigetstr('cr')
+        self.UP=curses.tigetstr('cuu1')
+        self.CLEAR_EOL=curses.tigetstr('el')
+        
+    def initProgressBar(self,total=100,finished=0,status=""):
+        self._isInitialized=1
+        self.total=total
+        self.finished=finished
+        self.status=status
+        stdout.write('\n')
+    
+    def updateProgressBar(self,total,finished,status=None):
+        if self._isInitialized:
+            self.total=total
+            self.finished=finished
+            if status is not None:
+                self.status=status
+            self._renderBar()
+        else:
+            self.initProgressBar()
+    
+    def stopProgressBar(self):
+        self._isInitialized=0
+        stdout.write('\n')
+        stdout.flush()
+        
+    def message(self,msg):
+        stdout.write(msg)
+        stdout.write('\n')
+        stdout.flush()
+        
+    def updateStatus(self,status):
+        if self._isInitialized:
+            self.status=status
+            self._renderBar()
+        else:
+            self.message(status)
+    
+    def _renderBar(self):
+        if self._isInitialized:
+            ratio=float(self.finished)/self.total
+            f=int((self.COLS-20)*ratio)
+            nof=self.COLS-20-f
+            stdout.write(self.BOL+self.UP+self.CLEAR_EOL+" [%s%s] %.1f%%\n"%('x'*f,'-'*nof,100*ratio))
+            if self.status is not None:
+                stdout.write(self.BOL+self.CLEAR_EOL+" Status: "+self.status)
+            stdout.flush()
 
 class ObservableSMTP(SMTP):
     def __init__(self,host='',port=0,local_hostname=None):
         SMTP.__init__(self, host, port, local_hostname)
         # Use a dummy function for the progress bar
         self.progressBar=lambda total,sent,speed,elapsed:None
+        self.ui=None
         
-    def setProgressBar(self,progressBar):
-        self.progressBar=progressBar
+    def setUI(self,ui):
+        self.ui=ui
     
-    def _updateProgress(self,total,sent,speed,elapsed):
-        self.progressBar(total,sent,speed,elapsed)
+    def _updateProgress(self,total,sent,status):
+        if self.ui is not None:
+            self.ui.updateProgressBar(total,sent,status)
     
     def send(self, str):
         """Send `str' to the server."""
@@ -54,20 +114,16 @@ class ObservableSMTP(SMTP):
             total=len(str)    # the total length of the str(the email) to be sent
             sent=0            # the size of the sent data (c)
             buff=2048         # buff size (c)
-            speed=0           # the sending speed, (cps)
-            elapsed=0.0001    # the elapsed time, (s)
             try:
-                start_time=time.clock()
                 while(1):
-                    self._updateProgress(total,sent,speed,elapsed)
+                    self._updateProgress(total,sent,"Transferring...... (%d/%d)"%(sent,total))
+                    #self.ui.updateStatus("Transferring...... (%d/%d)"%(sent,total))
                     begin,end=sent,sent+buff
                     data=str[begin:end]
                     len_of_data=len(data)
                     if len_of_data>0:
                         self.sock.sendall(data)
-                        elapsed=time.clock()-start_time
                         sent+=len_of_data
-                        speed=sent/elapsed
                     else:
                         break
 
@@ -76,28 +132,171 @@ class ObservableSMTP(SMTP):
                 raise SMTPServerDisconnected('Server not connected')
         else:
             raise SMTPServerDisconnected('please run connect() first')
+        
+    def putcmd(self,cmd,args=""):
+        """Send a command to the server."""
+        if args=="":
+            str='%s%s'%(cmd,smtplib.CRLF)
+        else:
+            str='%s %s%s'%(cmd,args,smtplib.CRLF)
+        # Don't monitor the command data
+        SMTP.send(self,str)
 
-
-class GSMsgBuilder(object):
-    """
-        This class is used to build emails.
-    """
+class GSSender(object):
     SIZE_OF_MEGA_BYTE=1024*1024
 
-    def __init__(self, maxAttSizeMb=5,email_encoding='utf-8',fs_encoding=None):
-        self.maxAttSize=maxAttSizeMb*GSMsgBuilder.SIZE_OF_MEGA_BYTE
+    def __init__(self,host,port,login, paswd,attachment_size=5,
+                    email_encoding='utf-8',fs_encoding='utf-8', tls=True,ui=None):
+        self.host=host
+        self.port=port
+        self.login=login
+        self.fromAddr=login
+        self.paswd=paswd
+        self.smtp=None
+        self.smtp_connected=False
+        self.tls=tls
+        self.encoding=email_encoding
+        self.fs_encoding=fs_encoding
+        self.maxAttSize=attachment_size*GSSender.SIZE_OF_MEGA_BYTE
         self.encoding=email_encoding
         if fs_encoding==None:
             self.fs_encoding=sys.getfilesystemencoding()
         else:
             self.fs_encoding=fs_encoding
+        self.ui=ui
         
+    def send(self,toAddrs,attachment,additional_text=''):
+        """Send the file to the addrs"""
+        # get the file infos
+        filename=os.path.basename(attachment)
+        attachfile=open(attachment.encode(self.fs_encoding), 'rb')
+        self.ui.message("Preparing...")
+        try:
+            # caculate the md5sum for the file
+            md5sum=self._md5sum(attachfile)
+            # after caculating the md5sum, the cursor is now at the end of the file object
+            # the offset of the cursor is indeed the file size.
+            size=attachfile.tell()
+            # go back to the beginning of the file for further use
+            attachfile.seek(0)
+            
+            fid=uuid.uuid1().__str__()
+            
+            fromAddr=self.fromAddr
+       
+            if size<self.maxAttSize:
+                # send one email
+                self.ui.message("There is 1 email to send.")
+                fobj=attachfile.read()
+                subject="[GS_SINGLE][Name: %s]"%filename
+                text=self._composeFileInfo(filename,size,fid,md5sum,additional_text)
+                msg=self._buildBaseMsg(fromAddr, toAddrs, subject, text)
+                msg.attach(self._buildAttachmentPart(filename,fobj))
+                
+                self.ui.message("Sending email 1 of 1.")
+                self._doSend(toAddrs,msg)
+                self.ui.message("Job finished!")
+            else:
+                # send multi emails with a summary
+                num_of_packages=int(size/self.maxAttSize)+(size%self.maxAttSize and 1 or 0)
+                self.ui.message("There are %d packages and 1 summary to send."%num_of_packages)
+                package_count=0
+                # Send the packages of the file
+                while(1):
+                    fobj=attachfile.read(self.maxAttSize)
+                    package_size=len(fobj)
+                    if package_size == 0:
+                        break
+                    package_checksum=self._buffMd5sum(fobj)
+    
+                    subject="[GS_PART][NAME: %s][%03d]"%(filename, package_count)
+                    text=self._composeFileInfo(filename,size,fid,md5sum,additional_text,
+                             0,package_count,package_size,package_checksum)
+                    msg=self._buildBaseMsg(fromAddr, toAddrs, subject, text)
+                    msg.attach(self._buildAttachmentPart("%s.%03d"%(filename, package_count),fobj))
+    
+                    self.ui.message("Sending package %d of %d."%(package_count+1,num_of_packages))
+                    self._doSend(toAddrs,msg)
+                    package_count+=1
+                
+                # Send the summary of the file
+                subject="[GS_SUM][NAME: %s]"%(filename)
+                text=self._composeFileInfo(filename,size,fid,md5sum,additional_text,
+                             num_of_packages=package_count)
+                msg=self._buildBaseMsg(fromAddr, toAddrs, subject, text)
+                self.ui.message("Sending the summary.")
+                self._doSend(toAddrs,msg)
+                self.ui.message("Job finished.")
+        finally:
+            attachfile.close()
+            self._disconnect()
+    
+    def _doSend(self, toAddrs, msg, retry_times=5):
+        retry_count=0
+        self.ui.initProgressBar()
+        while(1):
+            try:
+                if not self.smtp_connected:
+                     self._connect()
+                self.smtp.sendmail(self.fromAddr,toAddrs, msg.as_string())
+                break
+            except smtplib.SMTPException:
+                retry_count+=1
+                if retry_count<retry_times:
+                    self.ui.updateStatus("Transferring failed, the email will be re-sent in 5 secs.")
+                    time.sleep(5)
+                else:
+                    self.ui.updateStatus("Max retry times reached, sending failed!")
+                    break
+                #traceback.print_exc()
+        self.ui.stopProgressBar()
+
+    def _isConnected(self):
+        try:
+            self.smtp.noop()
+            return True
+        except:
+            return False
+
+    def _connect(self):
+        if self._isConnected():
+            return
+        try:
+            self.ui.updateStatus("Connecting to the SMTP server.")
+            smtp = ObservableSMTP(self.host,self.port)
+            smtp.setUI(self.ui)
+            if self.tls:
+                self.ui.updateStatus('Tring TLS authentication.')
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
+            self.ui.updateStatus('Logging in....')
+            smtp.login(self.login,self.paswd)
+            self.ui.updateStatus('Login Ok!')
+            self.smtp=smtp
+            self.smtp_connected=True
+        except smtplib.SMTPAuthenticationError :
+            self.ui.updateStatus("Authentication failed!")
+            sys.exit(2)
+        except smtplib.SMTPException,e:
+            #traceback.print_exception()
+            self.ui.updateStatus("SMTP Exception!")
+
+    def _disconnect(self):
+        try:
+            self._isConnected()
+            self.smtp.quit()
+        finally:
+            #print "SMTP server disconnected!"
+            self.smtp_connected=False
+            pass
+
     def _md5sum(self,fileobj):
         """Caculate the md5check of a fileobject"""
         m=md5.new()
         # For better performance, don't read the whole file at a time.
         while(1):
-            buff=fileobj.read(GSMsgBuilder.SIZE_OF_MEGA_BYTE)
+            buff=fileobj.read(GSSender.SIZE_OF_MEGA_BYTE)
             if len(buff)==0:
                 break
             m.update(buff)
@@ -120,7 +319,7 @@ class GSMsgBuilder(object):
         return part
     
     
-    def buildBaseMsg(self, fromAddr, toAddrs, subject, text, cc=[], bcc=[]):
+    def _buildBaseMsg(self, fromAddr, toAddrs, subject, text, cc=[], bcc=[]):
         """Build msg with no attachments"""
         encoding=self.encoding
         msg=MIMEMultipart(_charset=encoding)
@@ -137,17 +336,6 @@ class GSMsgBuilder(object):
         body=MIMEText(text.encode(encoding),_subtype='plain',_charset=encoding)
         msg.attach( body )
 
-        return msg
-
-    def buildMsg(self, fromAddr, toAddrs, subject, text, cc=[], bcc=[], attachments=[]):
-        """Build an email msg object with all the regular options"""
-        # Build the base msg
-        msg=self.buildBaseMsg(self, fromAddr, toAddrs, subject, text, cc, bcc,attachments)
-
-        # Attach the files
-        for att in attachments:
-            msg.attach(self._buildAttachmentPart(os.path.basename(att),
-                                             open(att.encode(self.fs_encoding),"rb").read()))
         return msg
 
     def _composeFileInfo(self,filename,size,fid,md5sum,additional_text='',num_of_packages=0,
@@ -173,141 +361,14 @@ class GSMsgBuilder(object):
             txt=text.getvalue()
             text.close()
             return txt
-
-    def buildFileMsgs(self, fromAddr, toAddrs, attachment, additional_text=''):
-        """Build one or more msgs(emails) for the file being sent"""
-        # bcc=toAddrs     # Use bcc by default
-        toAddrs=[]  # Hide the addrs
-        
-        # get the file infos
-        filename=os.path.basename(attachment)
-        attachfile=open(attachment.encode(self.fs_encoding), 'rb')
-        # caculate the md5sum for the file
-        md5sum=self._md5sum(attachfile)
-        # after caculating the md5sum, the cursor is now at the end of the file object
-        # the offset of the cursor is indeed the file size.
-        size=attachfile.tell()
-        # go back to the beginning of the file for further usage
-        attachfile.seek(0)
-        
-        fid=uuid.uuid1().__str__()
-        msgs=[]
-   
-        if size<self.maxAttSize:
-            # build one email
-            fobj=attachfile.read()
-            subject="[GS_SINGLE][Name: %s]"%filename
-            text=self._composeFileInfo(filename,size,fid,md5sum,additional_text)
-            msg=self.buildBaseMsg(fromAddr, toAddrs, subject, text)
-            msg.attach(self._buildAttachmentPart(filename,fobj))
-            
-            msgs.append(msg)
-        else:
-            # build multi emails with a summary
-            package_count=0
-            while(1):
-                fobj=attachfile.read(self.maxAttSize)
-                package_size=len(fobj)
-                if package_size == 0:
-                    break
-                package_checksum=self._buffMd5sum(fobj)
-
-                subject="[GS_PART][NAME: %s][%03d]"%(filename, package_count)
-                text=self._composeFileInfo(filename,size,fid,md5sum,additional_text,
-                         0,package_count,package_size,package_checksum)
-                msg=self.buildBaseMsg(fromAddr, toAddrs, subject, text)
-                msg.attach(self._buildAttachmentPart("%s.part.%03d"%(filename, package_count),fobj))
-
-                msgs.append(msg)
-                package_count+=1
-
-            subject="[GS_SUM][NAME: %s]"%(filename)
-            text=self._composeFileInfo(filename,size,fid,md5sum,additional_text,
-                         num_of_packages=package_count)
-            msg=self.buildBaseMsg(fromAddr, toAddrs, subject, text)
-
-            msgs.append(msg)
-
-        attachfile.close()
-
-        return msgs
-
-class GSSender(object):
-    def __init__(self,host,port,login, paswd,attachment_size=5,email_encoding='utf-8',fs_encoding=None, tls=True):
-        self.host=host
-        self.port=port
-        self.login=login
-        self.fromAddr=login
-        self.paswd=paswd
-        self.smtp=None
-        self.smtp_connected=False
-        self.tls=tls
-        self.builder=GSMsgBuilder(attachment_size,email_encoding,fs_encoding)
-
-    def sendFiles(self,toAddrs, files):
-        builder=self.builder
-
-        for f in files:
-            # 1. Build the msgs for the file
-            msgs=builder.buildFileMsgs(self.fromAddr, toAddrs, f)
-            print "Sending file: %s"%os.path.basename(f)
-            # 2. Send the msgs respectively
-            for msg in msgs:
-                while(1):
-                    if self._doSend(toAddrs, msg)==True:
-                        # TODO: Sleep+Retry times
-                        break
-            print "File '%s' was sent successfully."%os.path.basename(f)
-
-    def _connect(self):
-        if self.smtp_connected==True:
-            try:
-                self.smtp.noop()
-                # Already connected return directly.
-                return
-            except:
-                self.smtp_connected=False
-
-        try:
-            print "Connecting to SMTP server."
-            smtp = SMTP(self.host,self.port)
-            if self.tls:
-                smtp.ehlo()
-                smtp.starttls()
-                smtp.ehlo()
-            print "Logging in..."
-            smtp.login(self.login,self.paswd)
-            print "Login OK!"
-            self.smtp=smtp
-            self.smtp_connected=True
-        except :
-            traceback.print_exc()
-            print >>sys.stderr,"Unable to connect!!!"
-
-    def _disconnect(self):
-        try:
-            self.smtp_connected=False
-            self.smtp.quit()
-        finally:
-            print "SMTP server disconnected!"
-
-    def _doSend(self, toAddrs, msg):
-        try:
-            self._connect()
-            if self.smtp_connected:
-                self.smtp.sendmail(self.fromAddr,toAddrs, msg.as_string())
-                return True
-        except :
-            print >>sys.stderr,"Failed on sending msg!"
-            traceback.print_exc()
-
-        return False
+    
 
 
 class Main(object):
     def __init__(self):
         self.loadConfig()
         self.parseOpts()
+        self.ui=ConsoleUI()
         self.sender=GSSender(self.host,
                              self.port,
                              self.login,
@@ -315,7 +376,8 @@ class Main(object):
                              self.attachment_size,
                              self.encoding,
                              self.fsencoding,
-                             self.tls)
+                             self.tls,
+                             self.ui)
     
     def parseOpts(self):
         usage="usage: %prog [options] addr1 addr2 ..."
@@ -341,8 +403,12 @@ class Main(object):
                 print >>sys.stderr, "'%s' is not a file."%filename
                 sys.exit(2)
             elif not os.access(filename, os.R_OK):
-                print >>sys.stderr, "You don't have the permission to read the file '%s'."%filename
+                print >>sys.stderr, "You have no permission to read the file '%s'."%filename
                 sys.exit(2)
+
+        if self.opts.paswd==True or self.paswd == None or self.paswd =='':
+            self.paswd=getpass("Please enter the password:")
+
         if not self.args:
             print >>sys.stderr, "There's no receiver provided!"
             parser.print_usage()
@@ -382,8 +448,6 @@ class Main(object):
             
             # password is not provided in the conf file,
             # ask the user to input 
-            if self.paswd==None or self.paswd=='':
-                self.paswd=getpass("Please enter the password:")
             
             self.attachment_size=conf.getint('OPTIONS','attachment_size')
             self.encoding=conf.get('OPTIONS','email_encoding')
@@ -391,12 +455,18 @@ class Main(object):
     
     def run(self):
         try:
-            self.sender.sendFiles(self.args, [self.opts.filename])
-        except:
-            print sys.stderr,"Unhandle exception"
+            self.sender.send(self.args, self.opts.filename)
+        except (KeyboardInterrupt,SystemExit):
+            print "\nExiting the program...."
+            exit(2)
+        except :
+            traceback.print_exc()
+            print >>sys.stderr,"Unhandled exception occurred, program terminated unexceptedly!"
             exit(2)
                 
 
 if __name__=='__main__':
     main=Main()
     main.run()
+    sys.exit(0)
+
